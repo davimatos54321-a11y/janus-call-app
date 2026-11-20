@@ -10,3 +10,10 @@ orientation = portrait
 fullscreen = 0
 
 android.permissions = INTERNET,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,CAMERA,RECORD_AUDIO,MODIFY_AUDIO_SETTINGS,READ_CONTACTS,CALL_PHONE
+
+# Fixação estável para evitar build-tools incompatíveis ou sem aidl
+android.api = 33
+android.minapi = 21
+android.ndk = 25b
+android.sdk = 33
+android.accept_sdk_license = True
