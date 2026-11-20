@@ -44,11 +44,12 @@ jobs:
             pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev \
             cmake libffi-dev libssl-dev patch clang lld
 
-          python3 -m pip install --upgrade pip setuptools wheel "cython<3.0" buildozer
+          python3 -m pip install --upgrade pip setuptools wheel "cython<3.0" "buildozer==1.5.0" "python-for-android==2024.01.21"
 
       - name: Compilar APK debug
         run: |
           set -e
+          rm -rf .buildozer/android/platform
           buildozer android debug < /dev/null
 
       - name: Enviar APK como Artifact
