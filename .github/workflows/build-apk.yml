@@ -1,61 +1,63 @@
-[app]
+name: Build APK Janus Call
 
-# (str) Title of your application
-title = Janus Call
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
 
-# (str) Package name
-package.name = januscall
+jobs:
+  build:
+    runs-on: ubuntu-latest
 
-# (str) Package domain (needed for android/ios packaging)
-package.domain = org.januscall.app
+    steps:
+      - name: Clonar repositório
+        uses: actions/checkout@v4
 
-# (str) Source code where the main.py live
-source.dir = .
+      - name: Verificar arquivos essenciais
+        run: |
+          set -e
+          ls -la
+          test -f buildozer.spec
+          test -f main.py
+          python3 -m py_compile main.py
 
-# (list) Source files to include (let empty to include all the files)
-source.include_exts = py,png,jpg,kv,atlas,db,json
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-# (str) Application versioning (method 1)
-version = 0.1.0
+      - name: Instalar dependências do sistema com retry
+        run: |
+          set -e
+          APT_OK=0
+          for tentativa in 1 2 3; do
+            echo "Tentativa $tentativa de apt-get update..."
+            if sudo apt-get update -y; then
+              APT_OK=1
+              break
+            fi
+            sleep 5
+          done
+          test "$APT_OK" -eq 1
 
-# (list) Application requirements
-requirements = python3,kivy,urllib3,certifi,idna
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip openjdk-17-jdk python3-pip \
+            autoconf automake autopoint gettext libtool libltdl-dev \
+            pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev \
+            cmake libffi-dev libssl-dev patch clang lld
 
-# (str) Supported orientation (landscape, sensorLandscape, portrait or all)
-orientation = portrait
+          python3 -m pip install --upgrade pip setuptools wheel "cython<3.0" "buildozer==1.5.0" "python-for-android==2024.01.21"
 
-# (bool) Indicate if the application should be fullscreen or not
-fullscreen = 0
+      - name: Compilar APK debug
+        run: |
+          set -e
+          rm -rf .buildozer/android/platform
+          buildozer android debug < /dev/null
 
-# (list) Permissions
-android.permissions = INTERNET,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,CAMERA,RECORD_AUDIO,MODIFY_AUDIO_SETTINGS,READ_CONTACTS,CALL_PHONE
-
-# (int) Target Android API, should be as high as possible.
-android.api = 33
-
-# (int) Minimum API your APK / AAB will support.
-android.minapi = 21
-
-# (str) Android NDK version to use
-android.ndk = 25b
-
-# (int) Android SDK version to use
-android.sdk = 33
-
-# (bool) Accept SDK license automatically
-android.accept_sdk_license = True
-
-# (str) python-for-android branch to use, defaults to master
-p4a.branch = master
-
-# (list) The Android archs to build for
-android.archs = arm64-v8a
-
-
-[buildozer]
-
-# (int) Log level (0 = error only, 1 = info, 2 = debug (with command output))
-log_level = 2
-
-# (int) Display warning if buildozer is run as root (0 = False, 1 = True)
-warn_on_root = 1
+      - name: Enviar APK como Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: janus-call-apk
+          path: bin/*.apk
+          if-no-files-found: error
