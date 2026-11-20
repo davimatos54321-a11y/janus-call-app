@@ -13,13 +13,27 @@ jobs:
       - name: Clonar repositório
         uses: actions/checkout@v4
 
-      - name: Verificar arquivos essenciais
+      - name: Verificar arquivos essenciais e codificação .py
         run: |
           set -e
           ls -la
           test -f buildozer.spec
           test -f main.py
-          python3 -m py_compile main.py
+          python3 - <<'EOF'
+          import pathlib
+
+          for py_file in sorted(pathlib.Path(".").rglob("*.py")):
+              if ".buildozer" in py_file.parts:
+                  continue
+              raw = py_file.read_bytes()
+              try:
+                  text = raw.decode("utf-8")
+                  compile(text, str(py_file), "exec")
+                  print(f"OK: {py_file}")
+              except Exception as exc:
+                  print(f"ERRO em {py_file}: {exc}")
+                  raise
+          EOF
 
       - name: Configurar Python 3.11
         uses: actions/setup-python@v5
@@ -62,7 +76,7 @@ jobs:
             echo "=== ÚLTIMAS 100 LINHAS DO LOG ==="
             tail -n 100 buildozer_full.log
             echo "=== ERROS DO GRADLE / BUILD ==="
-            grep -E "FAILURE:|Execution failed|Could not|Exception|ERROR:|Error:|failed" buildozer_full.log | tail -n 50
+            grep -E "FAILURE:|Execution failed|Could not|Exception|ERROR:|Error:|failed|SyntaxError" buildozer_full.log | tail -n 50
             exit "$EXIT_CODE"
           fi
 
