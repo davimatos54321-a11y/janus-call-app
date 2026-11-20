@@ -1,4 +1,4 @@
-name: Build APK Resiliente (Janus Call)
+name: Build APK Janus Call
 
 on:
   workflow_dispatch:
@@ -13,56 +13,13 @@ jobs:
       - name: Clonar repositório
         uses: actions/checkout@v4
 
-      - name: Pré-checagem de integridade do projeto
-        run: |
-          set -e
-          test -f main.py
-          test -f buildozer.spec
-          python3 -m py_compile main.py
-
-      - name: Configurar Python 3.11
-        uses: actions/setup-python@v5
+      - name: Compilar APK com Buildozer Action
+        uses: ArtemSBulgakov/buildozer-action@v1
         with:
-          python-version: "3.11"
-
-      - name: Instalar dependências do sistema de forma adaptativa
-        run: |
-          set -e
-          sudo apt-get update -y
-          PACOTES_BASE="git zip unzip openjdk-17-jdk python3-pip autoconf automake autopoint gettext libtool libltdl-dev pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev patch clang lld"
-          PACOTES_OPCIONAIS="libtinfo5"
-
-          for pkg in $PACOTES_BASE; do
-            sudo apt-get install -y "$pkg"
-          done
-
-          for opt in $PACOTES_OPCIONAIS; do
-            sudo apt-get install -y "$opt" 2>/dev/null || true
-          done
-
-          python3 -m pip install --upgrade pip setuptools wheel "cython<3.0" buildozer
-
-      - name: Preparar ambiente Android SDK
-        run: |
-          mkdir -p "$HOME/.android" "$HOME/.buildozer"
-          touch "$HOME/.android/repositories.cfg"
-          yes | sdkmanager --licenses 2>/dev/null || true
-
-      - name: Compilar APK debug com diagnóstico
-        run: |
-          set +e
-          LOG_FILE="/tmp/buildozer.log"
-          buildozer android debug < /dev/null 2>&1 | tee "$LOG_FILE"
-          CODE=${PIPESTATUS[0]}
-          if [ "$CODE" -ne 0 ]; then
-            echo "================ ERROS REAIS NO LOG ================"
-            grep -iE "ERROR:|Command failed:|No matching distribution|Exception:|Traceback" "$LOG_FILE" | tail -n 40
-            echo "===================================================="
-          fi
-          exit "$CODE"
+          buildozer_version: stable
+          command: buildozer android debug
 
       - name: Enviar APK como Artifact
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: janus-call-apk
