@@ -1,10 +1,3 @@
-[app]
-title = Janus Call
-package.name = januscall
-package.domain = org.januscall.app
-source.dir = .
-source.include_exts = py,png,jpg,kv,atlas,json,sqlite
-version = 1.0.0
 requirements = python3,kivy,urllib3,certifi,idna
 orientation = portrait
 fullscreen = 0
@@ -16,3 +9,5 @@ android.minapi = 21
 android.ndk = 25b
 android.sdk = 33
 android.accept_sdk_license = True
+p4a.branch = master
+android.archs = arm64-v8a
