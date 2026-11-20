@@ -19,26 +19,40 @@ jobs:
           ls -la
           python3 -m py_compile main.py
 
-      - name: Compilar APK com Buildozer Action
-        id: buildozer
-        continue-on-error: true
-        uses: ArtemSBulgakov/buildozer-action@v1
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
         with:
-          buildozer_version: stable
-          command: buildozer android debug
+          python-version: "3.11"
 
-      - name: Exibir diagnóstico se o build falhar
-        if: steps.buildozer.outcome == 'failure'
+      - name: Instalar dependências do sistema com retry
         run: |
-          echo "=== Conteúdo da pasta atual e bin/ ==="
-          ls -la
-          ls -la bin/ 2>/dev/null || echo "Pasta bin/ ainda não existe"
-          echo "=== Últimas linhas do cache de buildozer ==="
-          find /home/runner -name "*.log" -type f 2>/dev/null | head -n 5 | xargs -r tail -n 30
-          exit 1
+          set -e
+          APT_OK=0
+          for tentativa in 1 2 3; do
+            echo "Tentativa $tentativa de apt-get update..."
+            if sudo apt-get update -y; then
+              APT_OK=1
+              break
+            fi
+            sleep 5
+          done
+          test "$APT_OK" -eq 1
+
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip openjdk-17-jdk python3-pip \
+            autoconf automake autopoint gettext libtool libltdl-dev \
+            pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev \
+            cmake libffi-dev libssl-dev patch clang lld
+
+          python3 -m pip install --upgrade pip setuptools wheel "cython<3.0" buildozer
+
+      - name: Compilar APK debug
+        run: |
+          set -e
+          buildozer android debug < /dev/null
 
       - name: Enviar APK como Artifact
-        if: steps.buildozer.outcome == 'success'
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: janus-call-apk
