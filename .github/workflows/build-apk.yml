@@ -13,13 +13,32 @@ jobs:
       - name: Clonar repositório
         uses: actions/checkout@v4
 
+      - name: Verificar arquivos essenciais
+        run: |
+          set -e
+          ls -la
+          python3 -m py_compile main.py
+
       - name: Compilar APK com Buildozer Action
+        id: buildozer
+        continue-on-error: true
         uses: ArtemSBulgakov/buildozer-action@v1
         with:
           buildozer_version: stable
           command: buildozer android debug
 
+      - name: Exibir diagnóstico se o build falhar
+        if: steps.buildozer.outcome == 'failure'
+        run: |
+          echo "=== Conteúdo da pasta atual e bin/ ==="
+          ls -la
+          ls -la bin/ 2>/dev/null || echo "Pasta bin/ ainda não existe"
+          echo "=== Últimas linhas do cache de buildozer ==="
+          find /home/runner -name "*.log" -type f 2>/dev/null | head -n 5 | xargs -r tail -n 30
+          exit 1
+
       - name: Enviar APK como Artifact
+        if: steps.buildozer.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: janus-call-apk
