@@ -49,6 +49,8 @@ jobs:
           python3 -m pip install --upgrade pip setuptools wheel "cython<3.0" "buildozer==1.5.0" "python-for-android==2024.01.21"
 
       - name: Compilar APK debug
+        env:
+          GRADLE_OPTS: "-Xmx2048m -Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2"
         run: |
           rm -rf .buildozer/android/platform
           set +e
@@ -57,10 +59,10 @@ jobs:
           set -e
 
           if [ "$EXIT_CODE" -ne 0 ]; then
-            echo "=== ÚLTIMAS 80 LINHAS DO LOG ==="
-            tail -n 80 buildozer_full.log
-            echo "=== LINHAS COM ERRO / TRACEBACK ==="
-            grep -E "ERROR:|Error:|Traceback|failed|No such file|not found" buildozer_full.log | tail -n 40
+            echo "=== ÚLTIMAS 100 LINHAS DO LOG ==="
+            tail -n 100 buildozer_full.log
+            echo "=== ERROS DO GRADLE / BUILD ==="
+            grep -E "FAILURE:|Execution failed|Could not|Exception|ERROR:|Error:|failed" buildozer_full.log | tail -n 50
             exit "$EXIT_CODE"
           fi
 
