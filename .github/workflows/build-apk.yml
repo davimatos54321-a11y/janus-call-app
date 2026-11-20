@@ -50,9 +50,19 @@ jobs:
 
       - name: Compilar APK debug
         run: |
-          set -e
           rm -rf .buildozer/android/platform
-          buildozer android debug < /dev/null
+          set +e
+          buildozer android debug < /dev/null > buildozer_full.log 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "=== ÚLTIMAS 80 LINHAS DO LOG ==="
+            tail -n 80 buildozer_full.log
+            echo "=== LINHAS COM ERRO / TRACEBACK ==="
+            grep -E "ERROR:|Error:|Traceback|failed|No such file|not found" buildozer_full.log | tail -n 40
+            exit "$EXIT_CODE"
+          fi
 
       - name: Enviar APK como Artifact
         if: success()
