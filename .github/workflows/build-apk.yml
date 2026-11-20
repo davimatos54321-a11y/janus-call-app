@@ -1,4 +1,4 @@
-name: Build APK com Buildozer
+name: Build APK Resiliente (Janus Call)
 
 on:
   workflow_dispatch:
@@ -13,22 +13,85 @@ jobs:
       - name: Clonar repositório
         uses: actions/checkout@v4
 
-      - name: Configurar Python
+      - name: Pré-checagem de integridade do projeto
+        run: |
+          set -e
+          test -f main.py && echo "[OK] main.py encontrado"
+          test -f buildozer.spec && echo "[OK] buildozer.spec encontrado"
+          python3 -m py_compile main.py && echo "[OK] Sintaxe de main.py válida"
+          df -h
+
+      - name: Configurar Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Instalar dependências do sistema e Buildozer
+      - name: Instalar dependências do sistema de forma adaptativa
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git zip unzip openjdk-17-jdk python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev
-          pip install --upgrade pip setuptools wheel cython buildozer
+          set -e
+          sudo apt-get update -y
+          PACOTES_BASE="git zip unzip openjdk-17-jdk python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev clang lld"
+          PACOTES_OPCIONAIS="libtinfo5"
 
-      - name: Compilar APK debug
+          for pkg in $PACOTES_BASE; do
+            if ! sudo apt-get install -y "$pkg"; then
+              echo "[AVISO] Falha ao instalar pacote base: $pkg"
+              exit 1
+            fi
+          done
+
+          for opt in $PACOTES_OPCIONAIS; do
+            if sudo apt-get install -y "$opt" 2>/dev/null; then
+              echo "[OK] Pacote opcional instalado: $opt"
+            else
+              echo "[ADAPTACAO] Pacote '$opt' indisponível neste Ubuntu; prosseguindo sem ele."
+            fi
+          done
+
+          python3 -m pip install --upgrade pip setuptools wheel cython==0.29.36 buildozer
+
+      - name: Preparar licenças do Android SDK
         run: |
-          buildozer android debug
+          mkdir -p "$HOME/.android" "$HOME/.buildozer"
+          touch "$HOME/.android/repositories.cfg"
+          yes | sdkmanager --licenses 2>/dev/null || true
+
+      - name: Compilar APK debug com autocura de falhas
+        run: |
+          set +e
+          LOG_FILE="/tmp/buildozer_build.log"
+          yes | buildozer android debug 2>&1 | tee "$LOG_FILE"
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "[DIAGNOSTICO] Build falhou com código $EXIT_CODE. Analisando causa raiz..."
+
+            if grep -qE "license|licenses were not accepted|build-tools|Aidl not found" "$LOG_FILE"; then
+              echo "[AUTOCURA] Detectado problema de SDK/build-tools/licença. Aplicando correção..."
+              yes | sdkmanager --licenses 2>/dev/null || true
+              yes | sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.2" 2>/dev/null || true
+              if grep -q "^android.build_tools_version" buildozer.spec; then
+                sed -i 's/^android.build_tools_version.*/android.build_tools_version = 33.0.2/' buildozer.spec
+              else
+                echo "android.build_tools_version = 33.0.2" >> buildozer.spec
+              fi
+              echo "[AUTOCURA] Tentando nova compilação após ajuste de SDK/build-tools..."
+              yes | buildozer android debug
+              EXIT_CODE=$?
+            fi
+
+            if [ "$EXIT_CODE" -ne 0 ] && grep -qE "No space left on device|corrupt|zip|download" "$LOG_FILE"; then
+              echo "[AUTOCURA] Detectado possível resíduo/cache problemático. Limpando cache temporário e tentando novamente..."
+              rm -rf .buildozer/android/platform/build-*/dists/* 2>/dev/null || true
+              yes | buildozer android debug
+              EXIT_CODE=$?
+            fi
+          fi
+
+          exit "$EXIT_CODE"
 
       - name: Enviar APK como Artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: janus-call-apk
