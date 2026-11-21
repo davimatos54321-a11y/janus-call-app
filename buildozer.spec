@@ -28,7 +28,8 @@ fullscreen = 0
 # Permissões Android para agenda, chamadas e futura voz/vídeo
 android.permissions = INTERNET,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,CAMERA,RECORD_AUDIO,MODIFY_AUDIO_SETTINGS,READ_CONTACTS,CALL_PHONE
 
-# API, SDK e NDK
+# AndroidX e versões de API / SDK / NDK
+android.enable_androidx = True
 android.api = 33
 android.minapi = 21
 android.ndk = 25b
