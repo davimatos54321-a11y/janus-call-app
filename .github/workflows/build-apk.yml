@@ -92,10 +92,10 @@ jobs:
           set -e
 
           if [ "$EXIT_CODE" -ne 0 ]; then
-            echo "=== DIAGNÓSTICO DO GRADLE / BUILD ==="
-            grep -n -C 15 -E "> Task .*:|A problem occurred|Caused by:|FAILURE:|Execution failed|Could not resolve|SDK location|NDK" buildozer_full.log | tail -n 120
-            echo "=== ÚLTIMAS 50 LINHAS DO LOG ==="
-            tail -n 50 buildozer_full.log
+            echo "=== OCORRÊNCIAS DE ERRO / FALHA NO LOG ==="
+            grep -n -C 10 -iE "failed|exception|error:|could not|outofmemory|compileSdk|build-tools|ndk" buildozer_full.log | tail -n 160
+            echo "=== ÚLTIMAS 140 LINHAS DO LOG ==="
+            tail -n 140 buildozer_full.log
             exit "$EXIT_CODE"
           fi
 
