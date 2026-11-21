@@ -13,18 +13,16 @@ jobs:
       - name: Clonar repositório
         uses: actions/checkout@v4
 
-      - name: Auditar estrutura e arquivos do projeto
+      - name: Agente guardião de arquivos e codificação
         run: |
           set -e
-          echo "=== ESTRUTURA DO PROJETO (SEM .git E .buildozer) ==="
-          find . -maxdepth 3 -not -path '*/.*' -not -path './.buildozer*' | sort
-          test -f buildozer.spec
           test -f main.py
+          test -f buildozer.spec
 
           python3 - <<'EOF'
           import pathlib
 
-          exts = {".py", ".kv", ".spec", ".yml", ".yaml", ".txt", ".json", ".ini", ".cfg"}
+          exts = {".py", ".kv", ".spec", ".yml", ".yaml", ".txt", ".json", ".ini", ".cfg", ".properties"}
           for path in sorted(pathlib.Path(".").rglob("*")):
               if not path.is_file():
                   continue
@@ -50,7 +48,7 @@ jobs:
                       compile(text, str(path), "exec")
                       print(f"OK: {path}")
                   except SyntaxError as exc:
-                      print(f"ERRO DE SINTAXE -> arquivo: {path} | linha: {exc.lineno} | {exc.msg}")
+                      print(f"ERRO DE SINTAXE -> {path} linha {exc.lineno}: {exc.msg}")
                       raise
           EOF
 
@@ -62,16 +60,16 @@ jobs:
       - name: Instalar dependências do sistema com retry
         run: |
           set -e
-          APT_OK=0
           for tentativa in 1 2 3; do
             echo "Tentativa $tentativa de apt-get update..."
             if sudo apt-get update -y; then
-              APT_OK=1
               break
+            fi
+            if [ "$tentativa" -eq 3 ]; then
+              exit 1
             fi
             sleep 5
           done
-          test "$APT_OK" -eq 1
 
           sudo apt-get install -y --no-install-recommends \
             git zip unzip openjdk-17-jdk python3-pip \
@@ -79,23 +77,48 @@ jobs:
             pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev \
             cmake libffi-dev libssl-dev patch clang lld
 
-          python3 -m pip install --upgrade pip setuptools wheel "cython<3.0" "buildozer==1.5.0" "python-for-android==2024.01.21"
+          python3 -m pip install --upgrade pip setuptools wheel \
+            "cython<3.0" "buildozer==1.5.0" "python-for-android==2024.01.21"
 
-      - name: Compilar APK debug
+      - name: Compilar APK debug com blindagem do Gradle
         env:
           GRADLE_OPTS: "-Xmx2048m -Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2"
+          JAVA_TOOL_OPTIONS: "-Xmx2048m"
         run: |
           rm -rf .buildozer/android/platform
+
+          # Prepara gradle.properties assim que a pasta .buildozer existir em background
+          (
+            for _ in $(seq 1 180); do
+              while IFS= read -r prop; do
+                if ! grep -q "org.gradle.workers.max=2" "$prop" 2>/dev/null; then
+                  {
+                    echo ""
+                    echo "org.gradle.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8"
+                    echo "org.gradle.daemon=false"
+                    echo "org.gradle.workers.max=2"
+                    echo "android.useAndroidX=true"
+                  } >> "$prop" 2>/dev/null || true
+                fi
+              done < <(find .buildozer -name "gradle.properties" 2>/dev/null || true)
+              sleep 5
+            done
+          ) &
+          WATCHER_PID=$!
+
           set +e
           buildozer android debug < /dev/null > buildozer_full.log 2>&1
           EXIT_CODE=$?
           set -e
 
+          kill "$WATCHER_PID" 2>/dev/null || true
+          wait "$WATCHER_PID" 2>/dev/null || true
+
           if [ "$EXIT_CODE" -ne 0 ]; then
-            echo "=== OCORRÊNCIAS DE ERRO / FALHA NO LOG ==="
-            grep -n -C 10 -iE "failed|exception|error:|could not|outofmemory|compileSdk|build-tools|ndk" buildozer_full.log | tail -n 160
-            echo "=== ÚLTIMAS 140 LINHAS DO LOG ==="
-            tail -n 140 buildozer_full.log
+            echo "=== CAUSA PROVÁVEL NO GRADLE / BUILD ==="
+            grep -n -C 12 -iE "FAILURE:|Execution failed|> Task .*:.*FAILED|Caused by:|Could not resolve|OutOfMemory|error:" buildozer_full.log | tail -n 140
+            echo "=== ÚLTIMAS 70 LINHAS DO LOG ==="
+            tail -n 70 buildozer_full.log
             exit "$EXIT_CODE"
           fi
 
