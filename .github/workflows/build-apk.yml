@@ -13,16 +13,18 @@ jobs:
       - name: Clonar repositório
         uses: actions/checkout@v4
 
-      - name: Sanitizar e validar arquivos do projeto
+      - name: Auditar estrutura e arquivos do projeto
         run: |
           set -e
-          ls -la
+          echo "=== ESTRUTURA DO PROJETO (SEM .git E .buildozer) ==="
+          find . -maxdepth 3 -not -path '*/.*' -not -path './.buildozer*' | sort
           test -f buildozer.spec
           test -f main.py
+
           python3 - <<'EOF'
           import pathlib
 
-          exts = {".py", ".kv", ".spec", ".yml", ".yaml", ".txt", ".json", ".ini"}
+          exts = {".py", ".kv", ".spec", ".yml", ".yaml", ".txt", ".json", ".ini", ".cfg"}
           for path in sorted(pathlib.Path(".").rglob("*")):
               if not path.is_file():
                   continue
@@ -32,17 +34,13 @@ jobs:
                   continue
 
               raw = path.read_bytes()
-              # Remove UTF-8 BOM se existir
               if raw.startswith(b"\xef\xbb\xbf"):
                   raw = raw[3:]
-
-              # Corrige erro comum de digitação em declarações de encoding
               raw = raw.replace(b"uft-8", b"utf-8").replace(b"uft8", b"utf-8")
 
               try:
                   text = raw.decode("utf-8")
               except UnicodeDecodeError:
-                  # Recupera arquivos salvos em Latin-1 / Windows-1252 (ex: \xf6, €)
                   text = raw.decode("cp1252", errors="replace")
 
               path.write_text(text, encoding="utf-8")
@@ -50,11 +48,10 @@ jobs:
               if path.suffix.lower() == ".py":
                   try:
                       compile(text, str(path), "exec")
+                      print(f"OK: {path}")
                   except SyntaxError as exc:
-                      print(f"ERRO DE SINTAXE EM {path} (linha {exc.lineno}): {exc.msg}")
+                      print(f"ERRO DE SINTAXE -> arquivo: {path} | linha: {exc.lineno} | {exc.msg}")
                       raise
-
-          print("Todos os arquivos verificados e normalizados em UTF-8.")
           EOF
 
       - name: Configurar Python 3.11
@@ -95,10 +92,10 @@ jobs:
           set -e
 
           if [ "$EXIT_CODE" -ne 0 ]; then
-            echo "=== ÚLTIMAS 100 LINHAS DO LOG ==="
-            tail -n 100 buildozer_full.log
-            echo "=== ERROS DO GRADLE / BUILD ==="
-            grep -E "FAILURE:|Execution failed|Could not|Exception|ERROR:|Error:|failed|SyntaxError" buildozer_full.log | tail -n 50
+            echo "=== CONTEXTO ANTES DOS ERROS PRINCIPAIS ==="
+            grep -n -C 20 -E "FAILURE:|Execution failed|Could not|Exception|ERROR:|SyntaxError" buildozer_full.log | tail -n 120
+            echo "=== ÚLTIMAS 60 LINHAS DO LOG ==="
+            tail -n 60 buildozer_full.log
             exit "$EXIT_CODE"
           fi
 
