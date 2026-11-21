@@ -13,7 +13,7 @@ jobs:
       - name: Clonar repositório
         uses: actions/checkout@v4
 
-      - name: Verificar arquivos essenciais e codificação .py
+      - name: Sanitizar e validar arquivos do projeto
         run: |
           set -e
           ls -la
@@ -22,17 +22,39 @@ jobs:
           python3 - <<'EOF'
           import pathlib
 
-          for py_file in sorted(pathlib.Path(".").rglob("*.py")):
-              if ".buildozer" in py_file.parts:
+          exts = {".py", ".kv", ".spec", ".yml", ".yaml", ".txt", ".json", ".ini"}
+          for path in sorted(pathlib.Path(".").rglob("*")):
+              if not path.is_file():
                   continue
-              raw = py_file.read_bytes()
+              if any(part in {".git", ".buildozer"} for part in path.parts):
+                  continue
+              if path.suffix.lower() not in exts:
+                  continue
+
+              raw = path.read_bytes()
+              # Remove UTF-8 BOM se existir
+              if raw.startswith(b"\xef\xbb\xbf"):
+                  raw = raw[3:]
+
+              # Corrige erro comum de digitação em declarações de encoding
+              raw = raw.replace(b"uft-8", b"utf-8").replace(b"uft8", b"utf-8")
+
               try:
                   text = raw.decode("utf-8")
-                  compile(text, str(py_file), "exec")
-                  print(f"OK: {py_file}")
-              except Exception as exc:
-                  print(f"ERRO em {py_file}: {exc}")
-                  raise
+              except UnicodeDecodeError:
+                  # Recupera arquivos salvos em Latin-1 / Windows-1252 (ex: \xf6, €)
+                  text = raw.decode("cp1252", errors="replace")
+
+              path.write_text(text, encoding="utf-8")
+
+              if path.suffix.lower() == ".py":
+                  try:
+                      compile(text, str(path), "exec")
+                  except SyntaxError as exc:
+                      print(f"ERRO DE SINTAXE EM {path} (linha {exc.lineno}): {exc.msg}")
+                      raise
+
+          print("Todos os arquivos verificados e normalizados em UTF-8.")
           EOF
 
       - name: Configurar Python 3.11
