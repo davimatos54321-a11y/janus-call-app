@@ -1,443 +1,425 @@
-import base64
+# -*- coding: utf-8 -*-
 import json
 import os
-import sqlite3
-import subprocess
 import threading
 import time
-import urllib.request
+from datetime import datetime
 
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import x25519
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-
-try:
-    from kivy.app import App
-    from kivy.clock import Clock
-    from kivy.core.window import Window
-    from kivy.uix.boxlayout import BoxLayout
-    from kivy.uix.button import Button
-    from kivy.uix.label import Label
-    from kivy.uix.scrollview import ScrollView
-    from kivy.uix.textinput import TextInput
-    TEM_KIVY = True
-except Exception:
-    TEM_KIVY = False
+import urllib3
+from kivy.app import App
+from kivy.clock import Clock
+from kivy.core.window import Window
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.label import Label
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.textinput import TextInput
 
 
-# ==================== CONFIGURAÇÕES DO APP ====================
-MEU_NOME = "Adailton"
-MEU_NUMERO = "+5519999999999"
-DDI_PADRAO = "55"
-
-# URL do seu servidor de sinalização WebRTC/mensagens (ex: https://seu-servidor.com)
-URL_SINALIZACAO_PADRAO = ""
-
-# Servidores STUN/TURN públicos/privados para travessia de rede (essenciais fora da LAN)
-SERVIDORES_ICE = [
-    {"urls": "stun:stun.l.google.com:19302"},
-    {"urls": "stun:stun1.l.google.com:19302"},
-    # Em produção comercial, adicione seu servidor TURN aqui:
-    # {"urls": "turn:seu-turn.exemplo.com:3478", "username": "usuario", "credential": "senha"},
-]
-
-PASTA_DADOS = (
-    "/storage/emulated/0/Download/JanusCallCommercial"
-    if os.path.exists("/storage/emulated/0/Download")
-    else os.path.expanduser("~/Downloads/JanusCallCommercial")
-)
-os.makedirs(PASTA_DADOS, exist_ok=True)
-CAMINHO_DB = os.path.join(PASTA_DADOS, "janus_call.sqlite")
-CAMINHO_CHAVE_PRIV = os.path.join(PASTA_DADOS, "chave_privada_x25519.pem")
+DATA_FILE = "janus_call_data.json"
+DEFAULT_SIGNAL_URL = "https://httpbin.org/post"
 
 
-def normalizar_e164(numero: str, ddi_padrao: str = DDI_PADRAO) -> str:
-    limpo = "".join(ch for ch in numero.strip() if ch.isdigit())
-    if not limpo:
-        return ""
-    if numero.strip().startswith("+"):
-        return f"+{limpo}"
-    if len(limpo) <= 11 and ddi_padrao:
-        return f"+{ddi_padrao}{limpo}"
-    return f"+{limpo}"
+class JanusStorage:
+    def __init__(self, filepath=DATA_FILE):
+        self.filepath = filepath
+        self.data = self._load()
 
+    def _default_data(self):
+        return {
+            "endpoint_url": DEFAULT_SIGNAL_URL,
+            "contacts": [
+                {"name": "Base Central", "target": "1001"},
+                {"name": "Operador 02", "target": "1002"},
+            ],
+            "history": [],
+        }
 
-# ==================== CRIPTOGRAFIA E2EE (X25519 + HKDF + AES-256-GCM) ====================
-class CofreSeguranca:
-    def __init__(self, caminho_chave_priv: str):
-        self.caminho_chave = caminho_chave_priv
-        if os.path.isfile(self.caminho_chave):
-            with open(self.caminho_chave, "rb") as f:
-                self._priv = serialization.load_pem_private_key(f.read(), password=None)
-        else:
-            self._priv = x25519.X25519PrivateKey.generate()
-            pem = self._priv.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption(),
-            )
-            with open(self.caminho_chave, "wb") as f:
-                f.write(pem)
-        self._pub = self._priv.public_key()
-
-    def chave_publica_b64(self) -> str:
-        raw = self._pub.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
-        return base64.b64encode(raw).decode("ascii")
-
-    def derivar_chave_sessao(self, pub_remota_b64: str, info: bytes = b"JanusCall-v1") -> bytes:
-        pub_bytes = base64.b64decode(pub_remota_b64.encode("ascii"))
-        pub_remota = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
-        segredo = self._priv.exchange(pub_remota)
-        return HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=None,
-            info=info,
-        ).derive(segredo)
-
-    @staticmethod
-    def cifrar(chave_aes: bytes, texto_plano: str, aad: str = "") -> str:
-        nonce = os.urandom(12)
-        ct = AESGCM(chave_aes).encrypt(
-            nonce,
-            texto_plano.encode("utf-8"),
-            aad.encode("utf-8") if aad else None,
-        )
-        return base64.b64encode(nonce + ct).decode("ascii")
-
-    @staticmethod
-    def decifrar(chave_aes: bytes, pacote_b64: str, aad: str = "") -> str:
-        raw = base64.b64decode(pacote_b64.encode("ascii"))
-        if len(raw) < 13:
-            raise ValueError("Pacote cifrado inválido.")
-        nonce, ct = raw[:12], raw[12:]
-        pt = AESGCM(chave_aes).decrypt(
-            nonce,
-            ct,
-            aad.encode("utf-8") if aad else None,
-        )
-        return pt.decode("utf-8")
-
-
-# ==================== BANCO DE DADOS (CONTATOS E CHAMADAS) ====================
-class BancoChamadas:
-    def __init__(self, caminho_db: str):
-        self.caminho_db = caminho_db
-        self.lock = threading.Lock()
-        self._init_db()
-
-    def _conn(self):
-        return sqlite3.connect(self.caminho_db, check_same_thread=False)
-
-    def _init_db(self):
-        with self.lock, self._conn() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS contatos (
-                    numero TEXT PRIMARY KEY,
-                    nome TEXT NOT NULL,
-                    pubkey_b64 TEXT DEFAULT '',
-                    atualizado_em INTEGER NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS historico (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    numero TEXT NOT NULL,
-                    canal TEXT NOT NULL,
-                    tipo_midia TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    criado_em INTEGER NOT NULL
-                )
-                """
-            )
-
-    def salvar_contato(self, numero: str, nome: str = "", pubkey_b64: str = ""):
-        num = normalizar_e164(numero)
-        if not num:
-            return None
-        agora = int(time.time())
-        with self.lock, self._conn() as conn:
-            atual = conn.execute("SELECT nome, pubkey_b64 FROM contatos WHERE numero = ?", (num,)).fetchone()
-            nome_final = nome.strip() or (atual[0] if atual else num)
-            pub_final = pubkey_b64.strip() or (atual[1] if atual else "")
-            conn.execute(
-                """
-                INSERT INTO contatos (numero, nome, pubkey_b64, atualizado_em)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(numero) DO UPDATE SET
-                    nome = excluded.nome,
-                    pubkey_b64 = excluded.pubkey_b64,
-                    atualizado_em = excluded.atualizado_em
-                """,
-                (num, nome_final, pub_final, agora),
-            )
-        return num
-
-    def buscar_contato(self, numero: str):
-        num = normalizar_e164(numero)
-        with self.lock, self._conn() as conn:
-            r = conn.execute("SELECT numero, nome, pubkey_b64 FROM contatos WHERE numero = ?", (num,)).fetchone()
-        if not r:
-            return None
-        return {"numero": r[0], "nome": r[1], "pubkey_b64": r[2]}
-
-    def listar_contatos(self):
-        with self.lock, self._conn() as conn:
-            rows = conn.execute("SELECT numero, nome, pubkey_b64 FROM contatos ORDER BY nome ASC").fetchall()
-        return [{"numero": r[0], "nome": r[1], "pubkey_b64": r[2]} for r in rows]
-
-    def registrar_chamada(self, numero: str, canal: str, tipo_midia: str, status: str):
-        num = normalizar_e164(numero)
-        with self.lock, self._conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO historico (numero, canal, tipo_midia, status, criado_em)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (num, canal, tipo_midia, status, int(time.time())),
-            )
-
-
-# ==================== MOTOR DE CHAMADAS (WEBRTC + TELEFONE) ====================
-class CentralChamadas:
-    def __init__(self, meu_numero: str, on_log=None):
-        self.meu_numero = normalizar_e164(meu_numero)
-        self.cofre = CofreSeguranca(CAMINHO_CHAVE_PRIV)
-        self.db = BancoChamadas(CAMINHO_DB)
-        self.on_log = on_log or (lambda s: print(s))
-
-        self.lock = threading.Lock()
-        self.url_sinalizacao = URL_SINALIZACAO_PADRAO
-        self.estado = "LIVRE"       # LIVRE | CHAMANDO | RECEBENDO | EM_CHAMADA
-        self.midia = "VOZ"          # VOZ | VIDEO
-        self.destino_atual = ""
-
-    def log(self, msg: str):
-        self.on_log(msg)
-
-    def configurar_servidor(self, url: str):
-        with self.lock:
-            self.url_sinalizacao = url.strip().rstrip("/")
-        self.log(f"[SERVIDOR] Sinalização configurada: {self.url_sinalizacao or 'nenhuma'}")
-
-    def ligar_webrtc(self, numero_raw: str, midia: str = "VOZ"):
-        num = normalizar_e164(numero_raw)
-        if not num:
-            self.log("[ERRO] Digite um número válido.")
-            return
-
-        midia = midia.upper()
-        with self.lock:
-            self.estado = "CHAMANDO"
-            self.midia = midia
-            self.destino_atual = num
-            url = self.url_sinalizacao
-
-        self.db.registrar_chamada(num, "WEBRTC", midia, "CHAMANDO")
-        self.log(f"[CHAMADA {midia}] Iniciando sessão segura para {num}...")
-
-        if not url:
-            self.log(
-                "[AVISO REDE] Nenhuma URL de sinalização configurada. "
-                "Para chamadas entre celulares na internet/Claro, informe o servidor de sinalização e TURN."
-            )
-            return
-
-        def _enviar_convite():
-            try:
-                payload = {
-                    "de": self.meu_numero,
-                    "para": num,
-                    "midia": midia,
-                    "pubkey": self.cofre.chave_publica_b64(),
-                    "ice_servers": SERVIDORES_ICE,
-                }
-                req = urllib.request.Request(
-                    f"{url}/call/invite",
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=6) as resp:
-                    self.log(f"[SINALIZAÇÃO] Convite {midia} enviado para {num} (HTTP {resp.status}).")
-            except Exception as e:
-                self.log(f"[ERRO SINALIZAÇÃO] Falha ao contatar servidor: {e}")
-
-        threading.Thread(target=_enviar_convite, daemon=True).start()
-
-    def atender_chamada(self):
-        with self.lock:
-            num = self.destino_atual
-            if not num:
-                self.log("[AVISO] Nenhuma chamada pendente para atender.")
-                return
-            self.estado = "EM_CHAMADA"
-        self.db.registrar_chamada(num, "WEBRTC", self.midia, "ATENDIDA")
-        self.log(f"[EM CHAMADA {self.midia}] Conectado com {num}.")
-
-    def desligar_chamada(self):
-        with self.lock:
-            num = self.destino_atual
-            self.estado = "LIVRE"
-            self.destino_atual = ""
-        if num:
-            self.db.registrar_chamada(num, "WEBRTC", self.midia, "ENCERRADA")
-        self.log("[CHAMADA ENCERRADA] Linha liberada.")
-
-    def ligar_telefone_padrao(self, numero_raw: str) -> bool:
-        """Abre o discador nativo do Android para chamada telefônica tradicional (rede da operadora)."""
-        num = normalizar_e164(numero_raw)
-        if not num:
-            self.log("[ERRO] Digite um número válido para ligar.")
-            return False
-
-        self.db.registrar_chamada(num, "TELEFONE_NATIVO", "VOZ", "DISCADO")
-        self.log(f"[TELEFONE] Abrindo discador padrão para {num}...")
-
+    def _load(self):
+        if not os.path.exists(self.filepath):
+            data = self._default_data()
+            self.save(data)
+            return data
         try:
-            subprocess.run(
-                ["am", "start", "-a", "android.intent.action.DIAL", "-d", f"tel:{num}"],
-                check=True,
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            base = self._default_data()
+            base.update({k: v for k, v in loaded.items() if k in base})
+            return base
+        except Exception:
+            data = self._default_data()
+            self.save(data)
+            return data
+
+    def save(self, data=None):
+        if data is not None:
+            self.data = data
+        with open(self.filepath, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    def add_contact(self, name, target):
+        name = name.strip() or f"Canal {target.strip()}"
+        target = target.strip()
+        if not target:
+            return
+        for c in self.data["contacts"]:
+            if c["target"] == target:
+                c["name"] = name
+                self.save()
+                return
+        self.data["contacts"].insert(0, {"name": name, "target": target})
+        self.save()
+
+    def add_history(self, target, mode, status_msg):
+        entry = {
+            "timestamp": datetime.now().strftime("%d/%m %H:%M:%S"),
+            "target": target,
+            "mode": mode,
+            "status": status_msg,
+        }
+        self.data["history"].insert(0, entry)
+        self.data["history"] = self.data["history"][:30]
+        self.save()
+
+
+class SignalClient:
+    def __init__(self):
+        self.http = urllib3.PoolManager(
+            timeout=urllib3.Timeout(connect=4.0, read=6.0),
+            retries=False,
+        )
+
+    def send_signal(self, url, payload):
+        url = (url or "").strip()
+        if not url:
+            return False, "Sem endpoint configurado (modo local)"
+        try:
+            encoded = json.dumps(payload).encode("utf-8")
+            resp = self.http.request(
+                "POST",
+                url,
+                body=encoded,
+                headers={"Content-Type": "application/json"},
             )
-            return True
-        except Exception as e:
-            self.log(f"[AVISO] Discador nativo indisponível neste ambiente ({e}).")
-            return False
+            if 200 <= resp.status < 300:
+                return True, f"Sinal OK (HTTP {resp.status})"
+            return False, f"Servidor respondeu HTTP {resp.status}"
+        except Exception as exc:
+            return False, f"Modo local/offline ({type(exc).__name__})"
 
 
-# ==================== INTERFACE DO APLICATIVO (KIVY) ====================
-if TEM_KIVY:
-    class JanusCallApp(App):
-        def build(self):
-            Window.clearcolor = (0.05, 0.07, 0.11, 1)
-            self.central = CentralChamadas(MEU_NUMERO, on_log=self._log_ui)
+class JanusCallRoot(BoxLayout):
+    def __init__(self, **kwargs):
+        super().__init__(orientation="vertical", padding=16, spacing=12, **kwargs)
+        self.storage = JanusStorage()
+        self.signal = SignalClient()
 
-            raiz = BoxLayout(orientation="vertical", padding=12, spacing=10)
+        self.call_state = "IDLE"  # IDLE, CALLING, ACTIVE
+        self.current_target = ""
+        self.current_mode = "VOZ"
+        self.elapsed_seconds = 0
+        self.timer_ev = None
 
-            raiz.add_widget(
-                Label(
-                    text=f"JANUS CALL  |  {MEU_NOME} ({MEU_NUMERO})",
-                    size_hint_y=None,
-                    height=44,
-                    bold=True,
-                    color=(0.35, 0.8, 1, 1),
-                )
+        self._build_ui()
+        self._refresh_contacts()
+        self._refresh_history()
+
+    def _build_ui(self):
+        # Cabeçalho
+        header = BoxLayout(orientation="horizontal", size_hint_y=None, height=56, spacing=8)
+        header.add_widget(
+            Label(
+                text="JANUS CALL",
+                font_size="26sp",
+                bold=True,
+                color=(0.30, 0.72, 1.0, 1),
+                halign="left",
+                valign="middle",
             )
+        )
+        self.timer_label = Label(
+            text="00:00",
+            font_size="22sp",
+            bold=True,
+            color=(0.45, 0.88, 1.0, 1),
+            size_hint_x=None,
+            width=90,
+        )
+        header.add_widget(self.timer_label)
+        self.add_widget(header)
 
-            self.txt_numero = TextInput(
-                hint_text="Número (ex: 19988887777 ou +14155550199)",
-                multiline=False,
+        # Painel de status
+        self.status_box = Label(
+            text="ESTADO: PRONTO",
+            font_size="18sp",
+            bold=True,
+            color=(0.55, 0.85, 1.0, 1),
+            size_hint_y=None,
+            height=44,
+        )
+        self.add_widget(self.status_box)
+
+        # Destino + nome do contato
+        self.target_input = TextInput(
+            text=self.storage.data["contacts"][0]["target"] if self.storage.data["contacts"] else "",
+            hint_text="ID, ramal ou endereço de destino",
+            multiline=False,
+            font_size="20sp",
+            size_hint_y=None,
+            height=62,
+            background_color=(0.11, 0.16, 0.24, 1),
+            foreground_color=(0.95, 0.98, 1.0, 1),
+            cursor_color=(0.35, 0.78, 1.0, 1),
+        )
+        self.add_widget(self.target_input)
+
+        contact_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=56, spacing=8)
+        self.name_input = TextInput(
+            hint_text="Nome do contato (opcional)",
+            multiline=False,
+            font_size="17sp",
+            background_color=(0.11, 0.16, 0.24, 1),
+            foreground_color=(0.95, 0.98, 1.0, 1),
+            cursor_color=(0.35, 0.78, 1.0, 1),
+        )
+        contact_row.add_widget(self.name_input)
+
+        save_btn = Button(
+            text="SALVAR",
+            font_size="17sp",
+            bold=True,
+            size_hint_x=None,
+            width=110,
+            background_normal="",
+            background_color=(0.12, 0.42, 0.78, 1),
+            color=(1, 1, 1, 1),
+        )
+        save_btn.bind(on_press=self.on_save_contact)
+        contact_row.add_widget(save_btn)
+        self.add_widget(contact_row)
+
+        # Modo de comunicação: VOZ / DADOS
+        mode_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=56, spacing=8)
+        self.mode_voz_btn = Button(
+            text="MODO VOZ",
+            font_size="18sp",
+            bold=True,
+            background_normal="",
+            background_color=(0.12, 0.48, 0.92, 1),
+            color=(1, 1, 1, 1),
+        )
+        self.mode_voz_btn.bind(on_press=lambda *_: self.set_mode("VOZ"))
+
+        self.mode_dados_btn = Button(
+            text="MODO DADOS",
+            font_size="18sp",
+            bold=True,
+            background_normal="",
+            background_color=(0.16, 0.22, 0.32, 1),
+            color=(0.75, 0.88, 1.0, 1),
+        )
+        self.mode_dados_btn.bind(on_press=lambda *_: self.set_mode("DADOS"))
+
+        mode_row.add_widget(self.mode_voz_btn)
+        mode_row.add_widget(self.mode_dados_btn)
+        self.add_widget(mode_row)
+
+        # Botões principais de ação
+        action_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=78, spacing=10)
+        self.call_btn = Button(
+            text="CHAMAR",
+            font_size="22sp",
+            bold=True,
+            background_normal="",
+            background_color=(0.08, 0.52, 0.95, 1),
+            color=(1, 1, 1, 1),
+        )
+        self.call_btn.bind(on_press=self.on_call)
+
+        self.hangup_btn = Button(
+            text="ENCERRAR",
+            font_size="20sp",
+            bold=True,
+            background_normal="",
+            background_color=(0.68, 0.16, 0.18, 1),
+            color=(1, 1, 1, 1),
+        )
+        self.hangup_btn.bind(on_press=self.on_hangup)
+
+        action_row.add_widget(self.call_btn)
+        action_row.add_widget(self.hangup_btn)
+        self.add_widget(action_row)
+
+        # Contatos rápidos
+        self.add_widget(
+            Label(
+                text="CONTATOS / CANAIS SALVOS",
+                font_size="15sp",
+                bold=True,
+                color=(0.45, 0.78, 1.0, 1),
+                size_hint_y=None,
+                height=28,
+                halign="left",
+            )
+        )
+        contacts_scroll = ScrollView(size_hint_y=None, height=110)
+        self.contacts_grid = GridLayout(cols=2, spacing=8, size_hint_y=None)
+        self.contacts_grid.bind(minimum_height=self.contacts_grid.setter("height"))
+        contacts_scroll.add_widget(self.contacts_grid)
+        self.add_widget(contacts_scroll)
+
+        # Histórico recente
+        self.add_widget(
+            Label(
+                text="REGISTRO DE CHAMADAS / SINAIS",
+                font_size="15sp",
+                bold=True,
+                color=(0.45, 0.78, 1.0, 1),
+                size_hint_y=None,
+                height=28,
+                halign="left",
+            )
+        )
+        history_scroll = ScrollView(size_hint_y=1)
+        self.history_label = Label(
+            text="Nenhum registro ainda.",
+            font_size="15sp",
+            color=(0.80, 0.90, 1.0, 1),
+            size_hint_y=None,
+            halign="left",
+            valign="top",
+        )
+        self.history_label.bind(
+            texture_size=lambda inst, val: setattr(inst, "height", max(val[1] + 16, 80)),
+            width=lambda inst, val: setattr(inst, "text_size", (val, None)),
+        )
+        history_scroll.add_widget(self.history_label)
+        self.add_widget(history_scroll)
+
+    def set_mode(self, mode):
+        self.current_mode = mode
+        if mode == "VOZ":
+            self.mode_voz_btn.background_color = (0.12, 0.48, 0.92, 1)
+            self.mode_dados_btn.background_color = (0.16, 0.22, 0.32, 1)
+        else:
+            self.mode_dados_btn.background_color = (0.12, 0.48, 0.92, 1)
+            self.mode_voz_btn.background_color = (0.16, 0.22, 0.32, 1)
+        self.status_box.text = f"ESTADO: {self.call_state} | MODO: {self.current_mode}"
+
+    def on_save_contact(self, _instance):
+        target = self.target_input.text.strip()
+        if not target:
+            self.status_box.text = "ESTADO: INFORME UM DESTINO PARA SALVAR"
+            return
+        self.storage.add_contact(self.name_input.text, target)
+        self.name_input.text = ""
+        self._refresh_contacts()
+        self.status_box.text = f"ESTADO: DESTINO {target} SALVO"
+
+    def _refresh_contacts(self):
+        self.contacts_grid.clear_widgets()
+        for c in self.storage.data["contacts"][:8]:
+            btn = Button(
+                text=f"{c['name']}\n[{c['target']}]",
+                font_size="15sp",
                 size_hint_y=None,
                 height=52,
-                font_size=19,
+                background_normal="",
+                background_color=(0.12, 0.25, 0.42, 1),
+                color=(0.88, 0.96, 1.0, 1),
             )
-            raiz.add_widget(self.txt_numero)
+            tgt = c["target"]
+            btn.bind(on_press=lambda _i, t=tgt: self._select_and_call(t))
+            self.contacts_grid.add_widget(btn)
 
-            self.txt_nome = TextInput(
-                hint_text="Nome do contato (opcional)",
-                multiline=False,
-                size_hint_y=None,
-                height=44,
-            )
-            raiz.add_widget(self.txt_nome)
+    def _select_and_call(self, target):
+        self.target_input.text = target
+        self.on_call(None)
 
-            self.txt_servidor = TextInput(
-                hint_text="URL servidor sinalização (ex: https://api.seudominio.com)",
-                multiline=False,
-                size_hint_y=None,
-                height=44,
-            )
-            raiz.add_widget(self.txt_servidor)
+    def _refresh_history(self):
+        items = self.storage.data["history"][:12]
+        if not items:
+            self.history_label.text = "Nenhum registro ainda."
+            return
+        lines = [
+            f"{it['timestamp']} | {it['mode']} -> {it['target']} ({it['status']})"
+            for it in items
+        ]
+        self.history_label.text = "\n".join(lines)
 
-            btn_srv = Button(text="SALVAR SERVIDOR", size_hint_y=None, height=44, background_color=(0.25, 0.35, 0.55, 1))
-            btn_srv.bind(on_press=lambda _: self.central.configurar_servidor(self.txt_servidor.text))
-            raiz.add_widget(btn_srv)
+    def on_call(self, _instance):
+        target = self.target_input.text.strip()
+        if not target:
+            self.status_box.text = "ESTADO: DIGITE UM DESTINO VÁLIDO"
+            return
 
-            # Linha 1: Chamada de Voz e Videochamada (App / WebRTC)
-            l1 = BoxLayout(size_hint_y=None, height=56, spacing=8)
-            b_voz = Button(text="CHAMAR VOZ", background_color=(0.12, 0.65, 0.35, 1), bold=True)
-            b_voz.bind(on_press=lambda _: self.central.ligar_webrtc(self.txt_numero.text, "VOZ"))
+        self.current_target = target
+        self.call_state = "CALLING"
+        self.elapsed_seconds = 0
+        self.timer_label.text = "00:00"
+        self.status_box.text = f"CHAMANDO {target} ({self.current_mode})..."
 
-            b_vid = Button(text="VIDEOCHAMADA", background_color=(0.15, 0.45, 0.85, 1), bold=True)
-            b_vid.bind(on_press=lambda _: self.central.ligar_webrtc(self.txt_numero.text, "VIDEO"))
+        payload = {
+            "app": "janus_call",
+            "event": "call_start",
+            "target": target,
+            "mode": self.current_mode,
+            "timestamp": datetime.now().isoformat(),
+        }
+        url = self.storage.data.get("endpoint_url", DEFAULT_SIGNAL_URL)
 
-            l1.add_widget(b_voz)
-            l1.add_widget(b_vid)
-            raiz.add_widget(l1)
+        threading.Thread(
+            target=self._worker_connect,
+            args=(url, payload, target),
+            daemon=True,
+        ).start()
 
-            # Linha 2: Atender, Desligar e Ligação Telefônica Padrão (tel:)
-            l2 = BoxLayout(size_hint_y=None, height=54, spacing=8)
-            b_at = Button(text="ATENDER", background_color=(0.18, 0.72, 0.48, 1), bold=True)
-            b_at.bind(on_press=lambda _: self.central.atender_chamada())
+    def _worker_connect(self, url, payload, target):
+        ok, info = self.signal.send_signal(url, payload)
+        time.sleep(0.5)
+        Clock.schedule_once(lambda _dt: self._on_connected(ok, info, target), 0)
 
-            b_de = Button(text="DESLIGAR", background_color=(0.82, 0.22, 0.22, 1), bold=True)
-            b_de.bind(on_press=lambda _: self.central.desligar_chamada())
+    def _on_connected(self, ok, info, target):
+        if self.call_state != "CALLING":
+            return
+        self.call_state = "ACTIVE"
+        self.status_box.text = f"EM CHAMADA: {target} | {info}"
+        self.storage.add_history(target, self.current_mode, info)
+        self._refresh_history()
 
-            b_tel = Button(text="LIGAR (TEL)", background_color=(0.45, 0.35, 0.75, 1), bold=True)
-            b_tel.bind(on_press=lambda _: self.central.ligar_telefone_padrao(self.txt_numero.text))
+        if self.timer_ev:
+            self.timer_ev.cancel()
+        self.timer_ev = Clock.schedule_interval(self._tick_timer, 1.0)
 
-            l2.add_widget(b_at)
-            l2.add_widget(b_de)
-            l2.add_widget(b_tel)
-            raiz.add_widget(l2)
+    def _tick_timer(self, _dt):
+        self.elapsed_seconds += 1
+        mins = self.elapsed_seconds // 60
+        secs = self.elapsed_seconds % 60
+        self.timer_label.text = f"{mins:02d}:{secs:02d}"
 
-            # Linha 3: Agenda
-            l3 = BoxLayout(size_hint_y=None, height=46, spacing=8)
-            b_sal = Button(text="SALVAR CONTATO", background_color=(0.25, 0.35, 0.55, 1))
-            b_sal.bind(on_press=self._salvar_contato)
+    def on_hangup(self, _instance):
+        if self.timer_ev:
+            self.timer_ev.cancel()
+            self.timer_ev = None
 
-            b_ver = Button(text="AGENDA", background_color=(0.25, 0.35, 0.55, 1))
-            b_ver.bind(on_press=self._ver_agenda)
+        duration = self.timer_label.text
+        prev_target = self.current_target or self.target_input.text.strip() or "N/A"
+        prev_state = self.call_state
+        self.call_state = "IDLE"
+        self.current_target = ""
+        self.status_box.text = f"ENCERRADA ({duration}) — PRONTO"
 
-            l3.add_widget(b_sal)
-            l3.add_widget(b_ver)
-            raiz.add_widget(l3)
+        if prev_state != "IDLE":
+            self.storage.add_history(prev_target, self.current_mode, f"Encerrada {duration}")
+            self._refresh_history()
 
-            self.lbl_log = Label(
-                text="Pronto para testes de chamada, agenda e E2EE.\n",
-                size_hint_y=None,
-                halign="left",
-                valign="top",
-                color=(0.88, 0.94, 1, 1),
-            )
-            self.lbl_log.bind(texture_size=lambda inst, val: setattr(inst, "height", max(200, val[1] + 20)))
-            self.lbl_log.bind(size=lambda inst, val: setattr(inst, "text_size", (val[0], None)))
 
-            scroll = ScrollView(size_hint=(1, 1))
-            scroll.add_widget(self.lbl_log)
-            raiz.add_widget(scroll)
-
-            return raiz
-
-        def _log_ui(self, msg: str):
-            Clock.schedule_once(lambda _: self._append(msg), 0)
-
-        def _append(self, msg: str):
-            self.lbl_log.text += f"{msg}\n"
-
-        def _salvar_contato(self, _):
-            num = self.central.db.salvar_contato(self.txt_numero.text, self.txt_nome.text)
-            if num:
-                self._append(f"[AGENDA] Contato salvo: {num}")
-
-        def _ver_agenda(self, _):
-            contatos = self.central.db.listar_contatos()
-            if not contatos:
-                self._append("[AGENDA] Vazia.")
-                return
-            linhas = ["[CONTATOS]:"] + [f" - {c['nome']} ({c['numero']})" for c in contatos]
-            self._append("\n".join(linhas))
+class JanusCallApp(App):
+    def build(self):
+        Window.clearcolor = (0.05, 0.07, 0.11, 1)
+        return JanusCallRoot()
 
 
 if __name__ == "__main__":
-    if TEM_KIVY:
-        JanusCallApp().run()
-    else:
-        print("Kivy não instalado neste ambiente. Instale 'kivy' e 'cryptography' para rodar a interface do app.")
+    JanusCallApp().run()
