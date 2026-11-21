@@ -92,10 +92,10 @@ jobs:
           set -e
 
           if [ "$EXIT_CODE" -ne 0 ]; then
-            echo "=== CONTEXTO ANTES DOS ERROS PRINCIPAIS ==="
-            grep -n -C 20 -E "FAILURE:|Execution failed|Could not|Exception|ERROR:|SyntaxError" buildozer_full.log | tail -n 120
-            echo "=== ÚLTIMAS 60 LINHAS DO LOG ==="
-            tail -n 60 buildozer_full.log
+            echo "=== DIAGNÓSTICO DO GRADLE / BUILD ==="
+            grep -n -C 15 -E "> Task .*:|A problem occurred|Caused by:|FAILURE:|Execution failed|Could not resolve|SDK location|NDK" buildozer_full.log | tail -n 120
+            echo "=== ÚLTIMAS 50 LINHAS DO LOG ==="
+            tail -n 50 buildozer_full.log
             exit "$EXIT_CODE"
           fi
 
